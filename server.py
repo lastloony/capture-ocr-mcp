@@ -31,9 +31,10 @@ OCR_LANG = os.environ.get("OCR_LANG", "ru")
 OCR_GPU = os.environ.get("OCR_GPU", "1") == "1"
 KEEP_OPEN = os.environ.get("KEEP_OPEN", "0") == "1"
 
-MIN_SKIP = 15          # кадров пропустить после открытия
-MAX_WAIT_FRAMES = 180  # ~3 с при 60 fps — ждать нормальный кадр
-GARBLED_CORR = 0.08    # чистые кадры дают ~-0.07, битые — от ~0.12
+MIN_SKIP = 15         # кадров пропустить после открытия
+WAIT_FRAMES = 30      # сколько кадров ждать нормальный, прежде чем сбрасывать карту
+RESET_ATTEMPTS = 2    # сколько раз сбрасывать карту, если она залипла
+GARBLED_CORR = 0.08   # чистые кадры дают ~-0.07, битые — от ~0.12
 
 mcp = MCPServer("capture-ocr")
 _cap_lock = threading.Lock()
@@ -71,24 +72,54 @@ def _is_garbled(frame):
     return float(np.corrcoef(a, b)[0, 1]) > GARBLED_CORR
 
 
+def _reset_device():
+    """Выводит карту из «залипшего» искажённого состояния: короткое открытие
+    в другом формате и разрешении заставляет её перенастроить масштабатор."""
+    cap = cv2.VideoCapture(DEVICE, cv2.CAP_DSHOW)
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        for _ in range(5):
+            cap.grab()
+    finally:
+        cap.release()
+
+
+def _read_clean(cap, skip):
+    """Первый нормальный кадр или None, если карта отдаёт только искажённые."""
+    for _ in range(skip):
+        cap.grab()
+    for _ in range(WAIT_FRAMES):
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError("Устройство открылось, но кадр не получен (нет сигнала?).")
+        if not _is_garbled(frame):
+            return frame, None
+    return None, frame
+
+
 def _grab():
     global _cap
     with _cap_lock:
         cap = _cap or _open()
+        skip = 1 if _cap else MIN_SKIP
+        _cap = None
         try:
-            # после открытия карта отдаёт пустые и битые кадры, иногда долго
-            for _ in range(1 if _cap else MIN_SKIP):
-                cap.grab()
-            for _ in range(MAX_WAIT_FRAMES):
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    raise RuntimeError("Устройство открылось, но кадр не получен (нет сигнала?).")
-                if not _is_garbled(frame):
+            for attempt in range(RESET_ATTEMPTS + 1):
+                frame, garbled = _read_clean(cap, skip)
+                if frame is not None:
                     return frame, ""
+                if attempt < RESET_ATTEMPTS:
+                    # карта «залипла» в искажённом режиме — сбросить и открыть заново
+                    cap.release()
+                    _reset_device()
+                    cap = _open()
+                    skip = MIN_SKIP
             # детектор мог ошибиться на необычном экране — отдаём кадр, но предупреждаем
-            return frame, (
+            return garbled, (
                 "ВНИМАНИЕ: кадр, похоже, искажён картой захвата (уменьшенная копия экрана "
-                "в левом верхнем углу). Если так и есть — переподключите карту.\n"
+                "в левом верхнем углу), сброс не помог. Переподключите карту.\n"
             )
         finally:
             if KEEP_OPEN:
