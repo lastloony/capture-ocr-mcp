@@ -20,7 +20,6 @@ import threading
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 import cv2
-import numpy as np
 from mcp.server.mcpserver import Image, MCPServer
 
 DEVICE = int(os.environ.get("CAPTURE_DEVICE", "0"))
@@ -31,10 +30,7 @@ OCR_LANG = os.environ.get("OCR_LANG", "ru")
 OCR_GPU = os.environ.get("OCR_GPU", "1") == "1"
 KEEP_OPEN = os.environ.get("KEEP_OPEN", "0") == "1"
 
-MIN_SKIP = 15         # кадров пропустить после открытия
-WAIT_FRAMES = 30      # сколько кадров ждать нормальный, прежде чем сбрасывать карту
-RESET_ATTEMPTS = 2    # сколько раз сбрасывать карту, если она залипла
-GARBLED_CORR = 0.08   # чистые кадры дают ~-0.07, битые — от ~0.12
+MIN_SKIP = 15  # кадров пропустить после открытия
 
 mcp = MCPServer("capture-ocr")
 _cap_lock = threading.Lock()
@@ -46,81 +42,36 @@ _rapid = None
 # ---------- захват ----------
 
 def _open():
-    cap = cv2.VideoCapture(DEVICE, cv2.CAP_DSHOW)
+    # Разрешение передаётся сразу при открытии. Если открыть устройство с
+    # настройками по умолчанию (OpenCV берёт 640x480) и потом переключить
+    # через set(), масштабатор карты MS2131 сбивается: живое изображение
+    # оказывается уменьшенным в углу кадра, остальное — старый буфер или шум.
+    cap = cv2.VideoCapture(DEVICE, cv2.CAP_DSHOW, [
+        cv2.CAP_PROP_FRAME_WIDTH, WIDTH,
+        cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT,
+    ])
     if not cap.isOpened():
         raise RuntimeError(
             f"Не удалось открыть устройство захвата #{DEVICE}. "
             "Возможно, его занимает OBS или другая программа."
         )
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
     return cap
-
-
-def _is_garbled(frame):
-    """Битый кадр после открытия карты: в левой верхней четверти лежит
-    уменьшенная копия всего кадра (старый буфер, разложенный неправильно)."""
-    g = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (960, 540), interpolation=cv2.INTER_AREA)
-    g = g.astype(np.float32)
-    half = cv2.resize(g, (480, 270), interpolation=cv2.INTER_AREA)
-    quarter = g[:270, :480]
-    mask = np.ones_like(quarter, bool)
-    mask[:135, :240] = False  # сама копия внутри копии — не сравниваем
-    a, b = half[mask], quarter[mask]
-    if a.std() < 1 or b.std() < 1:
-        return False
-    return float(np.corrcoef(a, b)[0, 1]) > GARBLED_CORR
-
-
-def _reset_device():
-    """Выводит карту из «залипшего» искажённого состояния: короткое открытие
-    в другом формате и разрешении заставляет её перенастроить масштабатор."""
-    cap = cv2.VideoCapture(DEVICE, cv2.CAP_DSHOW)
-    try:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        for _ in range(5):
-            cap.grab()
-    finally:
-        cap.release()
-
-
-def _read_clean(cap, skip):
-    """Первый нормальный кадр или None, если карта отдаёт только искажённые."""
-    for _ in range(skip):
-        cap.grab()
-    for _ in range(WAIT_FRAMES):
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            raise RuntimeError("Устройство открылось, но кадр не получен (нет сигнала?).")
-        if not _is_garbled(frame):
-            return frame, None
-    return None, frame
 
 
 def _grab():
     global _cap
     with _cap_lock:
-        cap = _cap or _open()
-        skip = 1 if _cap else MIN_SKIP
+        reused = _cap is not None
+        cap = _cap if reused else _open()
         _cap = None
         try:
-            for attempt in range(RESET_ATTEMPTS + 1):
-                frame, garbled = _read_clean(cap, skip)
-                if frame is not None:
-                    return frame, ""
-                if attempt < RESET_ATTEMPTS:
-                    # карта «залипла» в искажённом режиме — сбросить и открыть заново
-                    cap.release()
-                    _reset_device()
-                    cap = _open()
-                    skip = MIN_SKIP
-            # детектор мог ошибиться на необычном экране — отдаём кадр, но предупреждаем
-            return garbled, (
-                "ВНИМАНИЕ: кадр, похоже, искажён картой захвата (уменьшенная копия экрана "
-                "в левом верхнем углу), сброс не помог. Переподключите карту.\n"
-            )
+            # первые кадры после открытия бывают пустыми или из старого буфера
+            for _ in range(1 if reused else MIN_SKIP):
+                cap.grab()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError("Устройство открылось, но кадр не получен (нет сигнала?).")
+            return frame
         finally:
             if KEEP_OPEN:
                 _cap = cap
@@ -248,7 +199,7 @@ async def read_screen(
             Пусто = по умолчанию (rapid).
     min_score: отбросить фрагменты с уверенностью ниже порога (0..1, только rapid).
     """
-    frame, warning = await asyncio.to_thread(_grab)
+    frame = await asyncio.to_thread(_grab)
     reg = _parse_region(region)
     ox, oy = (reg[0], reg[1]) if reg else (0, 0)
     img = frame[oy:oy + reg[3], ox:ox + reg[2]] if reg else frame
@@ -268,7 +219,7 @@ async def read_screen(
         for x, y, w, h, t, s in items
         if not _is_noise(t, s, min_score)
     ]
-    return warning + (_layout(items, with_boxes) if items else "(текст не найден)")
+    return _layout(items, with_boxes) if items else "(текст не найден)"
 
 
 @mcp.tool()
@@ -278,7 +229,7 @@ async def screenshot(region: str = "", max_width: int = 1600) -> Image:
     region: необязательная область "x,y,w,h" в пикселях исходного кадра.
     max_width: уменьшить до этой ширины (экономит токены).
     """
-    frame, _ = await asyncio.to_thread(_grab)
+    frame = await asyncio.to_thread(_grab)
     reg = _parse_region(region)
     img = frame[reg[1]:reg[1] + reg[3], reg[0]:reg[0] + reg[2]] if reg else frame
     if img.shape[1] > max_width:
