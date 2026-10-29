@@ -1,0 +1,75 @@
+# capture-ocr MCP
+
+Локальный MCP-сервер (stdio) для Windows: берёт кадр с карты захвата
+(любое UVC-устройство, например `USB3.0 Video`) и распознаёт текст на экране
+подключённого к ней компьютера.
+
+- Основной OCR — **RapidOCR** (PP-OCRv5, модель `eslav`: русский + английский),
+  на видеокарте через DirectML. Полный экран 1920x1080 — ~0.5 с.
+- Запасной — встроенный OCR Windows (`engine="windows"`), хуже на мелком тексте.
+
+## Инструменты
+
+- `read_screen(region="", scale=1.0, with_boxes=False, engine="", min_score=0.5)` —
+  текст с экрана. Строки идут сверху вниз; фрагменты на одной высоте
+  (разные колонки/окна) разделены тремя пробелами.
+  - `region` = `"x,y,w,h"` в пикселях кадра 1920x1080;
+  - `scale` — увеличение (для всего экрана лучше 1.0; для маленькой области 2–3);
+  - `with_boxes` — координаты `[x,y,w,h]` у каждого фрагмента.
+- `screenshot(region="", max_width=1600)` — снимок экрана (JPEG).
+
+## Установка
+
+Требуется Windows 10/11 и Python 3.11+.
+
+```powershell
+git clone <url-репозитория> capture-ocr-mcp
+cd capture-ocr-mcp
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Модели RapidOCR (~20 МБ) скачиваются автоматически при первом запуске.
+Без видеокарты с DirectML поставьте `OCR_GPU=0` (CPU, ~3 с на кадр).
+
+## Подключение
+
+Claude Code (для всех проектов; пути — к вашей копии репозитория):
+
+```powershell
+claude mcp add capture-ocr -s user -- <путь>\capture-ocr-mcp\.venv\Scripts\python.exe <путь>\capture-ocr-mcp\server.py
+```
+
+После этого откройте новую сессию `claude` и проверьте `/mcp`.
+
+Другие клиенты (Claude Desktop, Cursor и т.п.) — в их mcp-конфиг:
+
+```json
+{
+  "mcpServers": {
+    "capture-ocr": {
+      "command": "<путь>\\capture-ocr-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["<путь>\\capture-ocr-mcp\\server.py"],
+      "env": { "CAPTURE_DEVICE": "0" }
+    }
+  }
+}
+```
+
+## Настройки (переменные окружения)
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `CAPTURE_DEVICE` | `0` | индекс устройства DirectShow |
+| `CAPTURE_WIDTH` / `CAPTURE_HEIGHT` | `1920` / `1080` | разрешение захвата |
+| `OCR_ENGINE` | `rapid` | `rapid` или `windows` |
+| `OCR_GPU` | `1` | RapidOCR на видеокарте через DirectML |
+| `OCR_LANG` | `ru` | язык для Windows OCR |
+| `KEEP_OPEN` | `0` | `1` — держать карту открытой между вызовами (быстрее, но блокирует OBS) |
+
+## Ограничения
+
+- Карту одновременно может использовать только одна программа — закройте OBS
+  (или задайте `CAPTURE_DEVICE` на виртуальную камеру OBS).
+- Текст с высотой букв ~3–4 px на кадре (например, уменьшенные превью окон)
+  не восстанавливается ничем — информации в пикселях нет.
